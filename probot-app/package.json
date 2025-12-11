@@ -1,0 +1,17 @@
+{
+  "name": "contextwizard-probot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "dev": "nodemon --exec \"probot run ./index.js\"",
+    "start": "probot run ./index.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.0",
+    "dotenv": "^17.2.3",
+    "probot": "^13.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  }
+}
