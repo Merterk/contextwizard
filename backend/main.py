@@ -1,11 +1,23 @@
 # backend/main.py
-from typing import List, Optional
+from dotenv import load_dotenv
+load_dotenv()
+
+from typing import List, Optional, Literal
 from fastapi import FastAPI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+import os
+import json
+import sys
+
+from google import genai
+types = genai.types  # alias for convenience
 
 app = FastAPI()
 
 
+# ----------------------------
+# Payload models (same as yours)
+# ----------------------------
 class FileInfo(BaseModel):
     filename: str
     status: Optional[str] = None
@@ -51,7 +63,7 @@ class ReviewPayload(BaseModel):
 
     files: Optional[List[FileInfo]] = None
 
-    # 🔥 NEW: all inline comments that belong to this finished review
+    # all inline comments that belong to this finished review
     review_comments: Optional[List[ReviewCommentInfo]] = None
 
 
@@ -59,50 +71,237 @@ class BackendResponse(BaseModel):
     comment: str
 
 
-@app.post("/analyze-review", response_model=BackendResponse)
-async def analyze_review(payload: ReviewPayload):
-    # Debug: print full JSON payload to server stderr
-    import json, sys
+# ----------------------------
+# Gemini structured output model
+# ----------------------------
+Category = Literal[
+    "PRAISE",
+    "GOOD_CHANGE",
+    "BAD_CHANGE",
+    "GOOD_QUESTION",
+    "BAD_QUESTION",
+    "UNKNOWN",  # safety fallback
+]
 
-    print("==== Incoming payload ====", file=sys.stderr)
-    print(json.dumps(payload.dict(), indent=2), file=sys.stderr)
-    print("==========================", file=sys.stderr)
 
-    files = payload.files or []
-    num_files = len(files)
+class Classification(BaseModel):
+    category: Category
+    needs_reply: bool = Field(..., description="True only for GOOD_CHANGE, BAD_CHANGE, BAD_QUESTION.")
+    needs_clarification: bool = Field(..., description="True only for BAD_CHANGE or BAD_QUESTION.")
+    confidence: float = Field(..., ge=0.0, le=1.0)
+    short_reason: str = Field(..., description="One short sentence. No chain-of-thought.")
 
-    # figure out where the text came from
-    if payload.kind == "review":
-        source_desc = f"full review (**{payload.review_state}**)"
-        text = payload.review_body or ""
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def get_client() -> genai.Client:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not set")
+    return genai.Client(api_key=api_key)
+
+
+def clip(s: Optional[str], n: int) -> str:
+    if not s:
+        return ""
+    return s if len(s) <= n else s[:n] + "\n…(truncated)…"
+
+
+def build_llm_context(payload: ReviewPayload) -> str:
+    """
+    Compact, high-signal context for classification ONLY.
+
+    You are currently sending ALL files/patches from Probot — we keep accepting that,
+    but only include a truncated subset here to avoid context bloat.
+    """
+    pr_title = payload.pr_title or ""
+    pr_body = clip(payload.pr_body, 1200)
+
+    base = f"""
+Repo: {payload.repo_full_name}
+PR: #{payload.pr_number} — {pr_title}
+PR author: {payload.pr_author_login}
+
+PR description (truncated):
+{pr_body}
+""".strip()
+
+    if payload.kind == "review_comment":
+        comment_text = payload.comment_body or ""
+        path = payload.comment_path or ""
+        hunk = clip(payload.comment_diff_hunk, 1200)
+
+        base += f"""
+
+Event: inline review comment
+Reviewer: {payload.reviewer_login}
+File path: {path}
+Original comment:
+{clip(comment_text, 1500)}
+
+Diff hunk (truncated):
+{hunk}
+""".rstrip()
+
     else:
-        source_desc = (
-            f"inline comment on `{payload.comment_path}` "
-            f"(position {payload.comment_position})"
-        )
-        text = payload.comment_body or ""
+        review_text = payload.review_body or ""
+        base += f"""
 
-    header = (
-        f"I received a **{payload.kind}** ({source_desc}) on PR "
-        f"**#{payload.pr_number} – {payload.pr_title}** in `{payload.repo_full_name}`.\n\n"
-        f"**Reviewer:** `{payload.reviewer_login}`\n\n"
-        f"**Original text:**\n\n> {text.replace('\n', '\n> ')}\n\n"
-        f"I see **{num_files} changed file(s)**.\n\n"
+Event: review submitted
+Reviewer: {payload.reviewer_login}
+State: {payload.review_state}
+Review body:
+{clip(review_text, 2000)}
+""".rstrip()
+
+        if payload.review_comments:
+            base += "\n\nInline comments in this review (showing up to 5):\n"
+            for c in payload.review_comments[:5]:
+                base += (
+                    f"- id={c.id} file={c.path} line={c.line or c.position} "
+                    f"by {c.user_login}: {clip(c.body, 400)}\n"
+                )
+
+    # Include changed files + patches (truncated)
+    files = payload.files or []
+    if files:
+        base += f"\n\nChanged files: {len(files)} (showing up to 6 patches, truncated)\n"
+        for f in files[:6]:
+            base += (
+                f"\n---\nFILE: {f.filename}\nSTATUS: {f.status} "
+                f"(+{f.additions}/-{f.deletions}, changes={f.changes})\n"
+                f"PATCH:\n{clip(f.patch, 1200)}\n"
+            )
+
+    return base.strip()
+
+async def classify_with_gemini(payload: ReviewPayload) -> Classification:
+    client = get_client()
+    model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+
+    system_instructions = """
+You are a code review assistant that classifies a GitHub PR inline review comment
+into exactly ONE category.
+
+Decision priority:
+1) First determine the INTENT of the comment:
+   - praise
+   - question
+   - request to change code
+2) Then determine whether the intent is CLEAR (good) or UNCLEAR (bad).
+
+Categories:
+1) PRAISE:
+   - Only positive reaction.
+   - No actionable request.
+
+2) GOOD_CHANGE:
+   - Clear, actionable request to change code.
+
+3) BAD_CHANGE:
+   - A request to change code, but unclear, underspecified, or poorly explained.
+   - Needs clarification before code can be suggested.
+
+4) GOOD_QUESTION:
+   - A clear question.
+   - No action required by the bot.
+
+5) BAD_QUESTION:
+   - A question, but unclear, ambiguous, or underspecified.
+   - Bot should ask clarifying questions.
+
+Important notes:
+- "bad" means unclear, ambiguous, or underspecified — NOT rude or toxic.
+- Informal language, slang, sarcasm, emojis, or non-English text
+  does NOT automatically make a comment bad.
+- Short comments are allowed to be GOOD if intent is still clear.
+- needs_reply must be true ONLY for:
+  GOOD_CHANGE, BAD_CHANGE, BAD_QUESTION.
+- needs_clarification must be true ONLY for:
+  BAD_CHANGE, BAD_QUESTION.
+- If intent cannot be determined, use category=UNKNOWN with low confidence.
+
+Return ONLY valid JSON that matches the provided schema.
+""".strip()
+
+    ctx = build_llm_context(payload)
+
+    resp = client.models.generate_content(
+        model=model,
+        contents=[
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part(
+                        text=f"{system_instructions}\n\nCONTEXT:\n{ctx}"
+                    )
+                ],
+            )
+        ],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=Classification,
+            temperature=0.2,
+        ),
     )
 
-    snippet = ""
+    # Structured output parsing (safe fallback)
+    data = getattr(resp, "parsed", None)
+    if data is None:
+        data = json.loads(resp.text)
 
-    # 🔎 If this is a finished review, show all its inline comments
-    if payload.kind == "review" and payload.review_comments:
-        snippet += f"### Inline comments that belong to this review ({len(payload.review_comments)}):\n\n"
-        for c in payload.review_comments[:10]:  # limit to first 10 for safety
-            snippet += f"- Comment `{c.id}` by `{c.user_login}` on `{c.path}` (line {c.line or c.position}):\n"
-            snippet += f"  > { (c.body or '').replace(chr(10), '\\n  > ') }\n\n"
-            if c.diff_hunk:
-                snippet += "  Diff hunk:\n\n```diff\n"
-                snippet += c.diff_hunk[:500]  # truncate long hunks
-                snippet += "\n```\n\n"
+    return Classification.model_validate(data)
 
-    footer = "_(auto-generated by ContextWizard backend – debug mode: knows all inline comments for this finished review)_"
 
-    return BackendResponse(comment=header + snippet + footer)
+
+def format_debug_comment(payload: ReviewPayload, cls: Classification) -> str:
+    where = "review" if payload.kind == "review" else "inline comment"
+    original_text = payload.review_body if payload.kind == "review" else payload.comment_body
+    original_text = (original_text or "").strip()
+
+    lines = [
+        "🧠 **ContextWizard (debug: classification only)**",
+        f"- event: `{where}`",
+        f"- category: **{cls.category}**",
+        f"- confidence: `{cls.confidence:.2f}`",
+        f"- needs_reply: `{cls.needs_reply}`",
+        f"- needs_clarification: `{cls.needs_clarification}`",
+        f"- reason: {cls.short_reason}",
+        "",
+        "**Original text:**",
+        f"> {(original_text[:500] + '…') if len(original_text) > 500 else original_text}".replace("\n", "\n> "),
+        "",
+        "_(classification only; no follow-up action taken)_",
+    ]
+    return "\n".join(lines).strip()
+
+
+# ----------------------------
+# FastAPI route
+# ----------------------------
+@app.post("/analyze-review", response_model=BackendResponse)
+async def analyze_review(payload: ReviewPayload):
+    # Print full payload (your existing debug)
+    print("==== Incoming payload ====", file=sys.stderr)
+    try:
+        print(json.dumps(payload.dict(), indent=2), file=sys.stderr)  # pydantic v1
+    except Exception:
+        print(json.dumps(payload.model_dump(), indent=2), file=sys.stderr)  # pydantic v2
+    print("==========================", file=sys.stderr)
+
+    # Classify (single Gemini call)
+    try:
+        cls = await classify_with_gemini(payload)
+    except Exception as e:
+        # Still return a debug comment so you see failures inside GitHub
+        cls = Classification(
+            category="UNKNOWN",
+            needs_reply=True,
+            needs_clarification=False,
+            confidence=0.0,
+            short_reason=f"Gemini classification failed: {type(e).__name__}: {str(e)[:160]}",
+        )
+
+    debug_comment = format_debug_comment(payload, cls)
+    return BackendResponse(comment=debug_comment)
