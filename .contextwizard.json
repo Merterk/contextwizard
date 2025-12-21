@@ -1,0 +1,10 @@
+{
+  "scan": {
+    "root": "docs",
+    "extensions": [".rst"],
+    "kind": "docs_rst"
+  },
+  "max_total_chars": 20000,
+  "max_docs": 100,
+  "max_chars_per_doc": 6000
+}
