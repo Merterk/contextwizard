@@ -11,3 +11,4 @@ probot-app/node_modules/
 
 # OS/files
 .DS_Store
+backend/.env
