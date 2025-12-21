@@ -1,20 +1,26 @@
 # backend/main.py
+from __future__ import annotations
+
 from dotenv import load_dotenv
+
 load_dotenv()
 
-from typing import List, Optional, Literal
+from typing import List, Optional, Literal, Callable, TypeVar
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 import os
 import json
 import sys
+import time
+import random
+import re
 
+import anyio
 from google import genai
-types = genai.types  # alias for convenience
 
-<<<<<<< Updated upstream
+types = genai.types  # alias for convenience
 app = FastAPI()
-=======
+
 # ----------------------------
 # Retry config (tune here)
 # ----------------------------
@@ -22,7 +28,6 @@ RETRY_INITIAL_DELAY_SEC = float(os.getenv("GEMINI_RETRY_INITIAL_DELAY", "0.35"))
 RETRY_MAX_DELAY_SEC = float(os.getenv("GEMINI_RETRY_MAX_DELAY", "2.0"))
 RETRY_MAX_ATTEMPTS = int(os.getenv("GEMINI_RETRY_MAX_ATTEMPTS", "12"))
 RETRY_JITTER_SEC = float(os.getenv("GEMINI_RETRY_JITTER_SEC", "0.10"))
->>>>>>> Stashed changes
 
 
 # ----------------------------
@@ -94,7 +99,7 @@ class BackendResponse(BaseModel):
 
 
 # ----------------------------
-# Gemini structured output model
+# Gemini structured output models
 # ----------------------------
 Category = Literal[
     "PRAISE",
@@ -102,7 +107,7 @@ Category = Literal[
     "BAD_CHANGE",
     "GOOD_QUESTION",
     "BAD_QUESTION",
-    "UNKNOWN",  # safety fallback
+    "UNKNOWN",
 ]
 
 
@@ -114,8 +119,6 @@ class Classification(BaseModel):
     short_reason: str = Field(..., description="One short sentence. No chain-of-thought.")
 
 
-<<<<<<< Updated upstream
-=======
 class ClarifiedQuestion(BaseModel):
     clarified_question: str = Field(..., description="A rewritten, clarified version of the original question.")
     confidence: float = Field(..., ge=0.0, le=1.0)
@@ -151,12 +154,10 @@ class CandidateReviewOutput(BaseModel):
     comments: List[CandidateReviewComment] = Field(default_factory=list)
 
 
->>>>>>> Stashed changes
 # ----------------------------
 # Helpers
 # ----------------------------
 def get_client() -> genai.Client:
-    """Returns the synchronous Gemini client."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not set")
@@ -170,9 +171,6 @@ def clip(s: Optional[str], n: int) -> str:
 
 
 def build_llm_context(payload: ReviewPayload) -> str:
-    """
-    Compact, high-signal context for classification and suggestion.
-    """
     pr_title = payload.pr_title or ""
     pr_body = clip(payload.pr_body, 1200)
 
@@ -203,8 +201,6 @@ Diff hunk (truncated):
 {hunk}
 """.rstrip()
 
-<<<<<<< Updated upstream
-=======
     elif payload.kind == "issue_comment":
         comment_text = payload.comment_body or ""
         base += f"""
@@ -233,7 +229,6 @@ Command comment:
         if hunk.strip():
             base += f"\nDiff hunk (truncated):\n{hunk}\n"
 
->>>>>>> Stashed changes
     else:
         review_text = payload.review_body or ""
         base += f"""
@@ -253,11 +248,7 @@ Review body:
                     f"by {c.user_login}: {clip(c.body, 400)}\n"
                 )
 
-<<<<<<< Updated upstream
-    # Include changed files + patches (truncated)
-=======
     # Diff context
->>>>>>> Stashed changes
     files = payload.files or []
     if files:
         base += f"\n\nChanged files: {len(files)} (showing up to 6 patches, truncated)\n"
@@ -282,9 +273,6 @@ Review body:
 
     return base.strip()
 
-<<<<<<< Updated upstream
-# NOTE: This function is SYNCHRONOUS (no 'async')
-=======
 
 def extract_first_fenced_code_block(text: str) -> str:
     """
@@ -378,98 +366,53 @@ def gemini_call_with_retry(
 # ----------------------------
 # Gemini calls (sync)
 # ----------------------------
->>>>>>> Stashed changes
 def classify_with_gemini(payload: ReviewPayload) -> Classification:
-    client = get_client() # Get synchronous client
+    client = get_client()
     model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
-    # The system instructions string for classification
     system_instructions = """
 You are a code review assistant that classifies a GitHub PR inline review comment
 into exactly ONE category.
 
 Decision priority:
-1) First determine the INTENT of the comment:
-    - praise
-    - question
-    - request to change code
-2) Then determine whether the intent is CLEAR (good) or UNCLEAR (bad).
+1) Determine intent: praise / question / request change
+2) Determine clarity: good / bad
 
-Categories:
-1) PRAISE:
-    - Only positive reaction.
-    - No actionable request.
+Categories: PRAISE, GOOD_CHANGE, BAD_CHANGE, GOOD_QUESTION, BAD_QUESTION
 
-2) GOOD_CHANGE:
-    - Clear, actionable request to change code.
+Rules:
+- "bad" = unclear/underspecified (not rude)
+- needs_reply true ONLY for: GOOD_CHANGE, BAD_CHANGE, BAD_QUESTION
+- needs_clarification true ONLY for: BAD_CHANGE, BAD_QUESTION
+- Unknown intent -> UNKNOWN with low confidence
 
-3) BAD_CHANGE:
-    - A request to change code, but unclear, underspecified, or poorly explained.
-    - Needs clarification before code can be suggested.
-
-4) GOOD_QUESTION:
-    - A clear question.
-    - No action required by the bot.
-
-5) BAD_QUESTION:
-    - A question, but unclear, ambiguous, or underspecified.
-    - Bot should ask clarifying questions.
-
-Important notes:
-- "bad" means unclear, ambiguous, or underspecified — NOT rude or toxic.
-- Informal language, slang, sarcasm, emojis, or non-English text
-    does NOT automatically make a comment bad.
-- Short comments are allowed to be GOOD if intent is still clear.
-- needs_reply must be true ONLY for:
-    GOOD_CHANGE, BAD_CHANGE, BAD_QUESTION.
-- needs_clarification must be true ONLY for:
-    BAD_CHANGE, BAD_QUESTION.
-- If intent cannot be determined, use category=UNKNOWN with low confidence.
-
-Return ONLY valid JSON that matches the provided schema.
+Return ONLY valid JSON for the schema.
 """.strip()
 
-    ctx = build_llm_context(payload)    
+    ctx = build_llm_context(payload)
 
-    # NOTE: No 'await' keyword here.
-    resp = client.models.generate_content(
-        model=model,
-        contents=[
-            types.Content(
-                role="user",
-                parts=[
-                    types.Part(
-                        text=f"{system_instructions}\n\nCONTEXT:\n{ctx}"
-                    )
-                ],
-            )
-        ],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=Classification,
-            temperature=0.2,
-        ),
-    )
+    def _call():
+        resp = client.models.generate_content(
+            model=model,
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[types.Part(text=f"{system_instructions}\n\nCONTEXT:\n{ctx}")],
+                )
+            ],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=Classification,
+                temperature=0.2,
+            ),
+        )
 
-<<<<<<< Updated upstream
-    # Structured output parsing (safe fallback)
-    data = getattr(resp, "parsed", None)
-    if data is None:
-        data = json.loads(resp.text)
-=======
         data = getattr(resp, "parsed", None)
         if data is None:
             data = json.loads(resp.text)
->>>>>>> Stashed changes
 
-    return Classification.model_validate(data)
+        return Classification.model_validate(data)
 
-<<<<<<< Updated upstream
-# NOTE: This function is SYNCHRONOUS (no 'async')
-def generate_code_suggestion(payload: ReviewPayload, cls: Classification) -> str:
-    client = get_client() # Get synchronous client
-    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash") # Use a powerful model for code
-=======
     return gemini_call_with_retry("classify_with_gemini", _call)
 
 
@@ -569,21 +512,12 @@ def generate_code_suggestion(
 
     reviewer_comment = (reviewer_comment_override or payload.comment_body or payload.review_body or "").strip()
     ctx = build_llm_context(payload)
->>>>>>> Stashed changes
 
-    # The system instructions string for code suggestion
     system_instructions = f"""
-You are an expert GitHub code review assistant. Your task is to provide a helpful, actionable code suggestion in response to a peer review comment.
+You are a GitHub code review assistant.
 
-Constraints:
-1. **Analyze the original comment** (provided below) and the surrounding **diff hunk**.
-2. **Focus ONLY on the requested change.**
-3. **If possible, provide the entire suggested file content or a complete function/class block that includes the fix.**
-4. **Your final output MUST be a clean, direct Markdown code block.** Do not include any introductory or explanatory text outside the code block.
+Goal: produce a SHORT, STRICT code suggestion for the requested change.
 
-<<<<<<< Updated upstream
-Reviewer's Intent (from Classification): {cls.category} - {cls.short_reason}
-=======
 Hard rules:
 - Output MUST be ONLY ONE fenced code block and NOTHING else.
 - The code block language MUST be either:
@@ -596,49 +530,30 @@ Hard rules:
 
 Comment to satisfy (source of truth):
 {reviewer_comment}
->>>>>>> Stashed changes
 """.strip()
 
-    # Reuse the context builder, but focus the prompt on the necessary fix
-    ctx = build_llm_context(payload)
-
-    # The full prompt string for code suggestion
     prompt = f"""
 {system_instructions}
 
-CONTEXT:
+CONTEXT (reference only):
 ---
 {ctx}
 ---
 
-Your task: Based on the "Original comment" and the "Diff hunk" in the context above, provide the corrected/suggested code.
+Return ONLY the single fenced code block now.
+""".strip()
 
-Return ONLY the code block in Markdown format.
-"""
+    def _call():
+        resp = client.models.generate_content(
+            model=model,
+            contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
+            config=types.GenerateContentConfig(temperature=0.2),
+        )
+        return extract_first_fenced_code_block((resp.text or "").strip())
 
-    # NOTE: No 'await' keyword here.
-    resp = client.models.generate_content(
-        model=model,
-        contents=[
-            types.Content(
-                role="user",
-                parts=[
-                    types.Part(text=prompt)
-                ],
-            )
-        ],
-        config=types.GenerateContentConfig(
-            temperature=0.3,
-        ),
-    )
-    
-    # Strip any potential leading/trailing text outside the code block
-    # and return the generated text.
-    return resp.text.strip()
+    return gemini_call_with_retry("generate_code_suggestion", _call)
 
 
-<<<<<<< Updated upstream
-=======
 def generate_pr_discussion_reply(payload: ReviewPayload) -> str:
     client = get_client()
     model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
@@ -737,7 +652,6 @@ Rules:
 # ----------------------------
 # Formatting helpers
 # ----------------------------
->>>>>>> Stashed changes
 def format_debug_comment(payload: ReviewPayload, cls: Classification) -> str:
     where = "review" if payload.kind == "review" else "inline comment"
     original_text = payload.review_body if payload.kind == "review" else payload.comment_body
@@ -760,8 +674,6 @@ def format_debug_comment(payload: ReviewPayload, cls: Classification) -> str:
     return "\n".join(lines).strip()
 
 
-<<<<<<< Updated upstream
-=======
 def format_clarification_question_comment(payload: ReviewPayload, cls: Classification, cq: ClarifiedQuestion) -> str:
     original_text = (payload.comment_body or payload.review_body or "").strip()
 
@@ -807,15 +719,11 @@ def format_bad_change_with_suggestion_comment(
     return out
 
 
->>>>>>> Stashed changes
 # ----------------------------
 # FastAPI route
 # ----------------------------
 @app.post("/analyze-review", response_model=BackendResponse)
 async def analyze_review(payload: ReviewPayload):
-<<<<<<< Updated upstream
-    # Print payload for debug (keep this)
-=======
     print(f"Processing kind: {payload.kind} for PR #{payload.pr_number}", file=sys.stderr)
 
     # 0) Wizard command: generate candidate review comments (FR5.2)
@@ -834,25 +742,18 @@ async def analyze_review(payload: ReviewPayload):
         except Exception as e:
             return BackendResponse(comment=f"❌ Error generating discussion reply: {type(e).__name__}: {str(e)[:180]}")
 
->>>>>>> Stashed changes
     print("==== Incoming payload ====", file=sys.stderr)
     try:
         print(json.dumps(payload.model_dump(), indent=2), file=sys.stderr)
     except Exception:
-        print(json.dumps(payload.dict(), indent=2), file=sys.stderr) 
+        print(json.dumps(payload.dict(), indent=2), file=sys.stderr)
     print("==========================", file=sys.stderr)
 
-<<<<<<< Updated upstream
-    # 1. Classify the comment/review
-=======
     # 1) Classify (only for review/review_comment)
     print("Classifying with Gemini...", file=sys.stderr)
->>>>>>> Stashed changes
     try:
-        # MUST use 'await' here to run the synchronous helper in a thread pool
-        cls = classify_with_gemini(payload)
+        cls = await anyio.to_thread.run_sync(classify_with_gemini, payload)
     except Exception as e:
-        # Fallback debug comment on classification failure
         cls = Classification(
             category="UNKNOWN",
             needs_reply=True,
@@ -860,61 +761,18 @@ async def analyze_review(payload: ReviewPayload):
             confidence=0.0,
             short_reason=f"Gemini classification failed: {type(e).__name__}: {str(e)[:160]}",
         )
-        # If classification fails, return the error immediately
-        final_comment_body = format_debug_comment(payload, cls)
-        return BackendResponse(comment=final_comment_body.strip())
+        return BackendResponse(comment=format_debug_comment(payload, cls))
 
-<<<<<<< Updated upstream
-    final_comment_body = ""
-
-    # 2. Check if a code suggestion is warranted
-    # Only attempt code suggestion for inline comments, NOT full reviews.
-    if payload.kind == "review_comment" and cls.category == "GOOD_CHANGE" and cls.confidence >= 0.7:
-=======
     if payload.kind not in ("review_comment", "review"):
         return BackendResponse(comment=format_debug_comment(payload, cls))
 
     # 2) GOOD_CHANGE -> strict code suggestion only
     if cls.category == "GOOD_CHANGE" and cls.confidence >= 0.7:
         print("Generating good change with Gemini...", file=sys.stderr)
->>>>>>> Stashed changes
         try:
-            # MUST use 'await' here to run the synchronous helper in a thread pool
-            suggestion = generate_code_suggestion(payload, cls)
-            
-            # Format the final comment body for GitHub
-            final_comment_body = f"""
-**🤖 Code Suggestion ({cls.category} - {cls.confidence:.2f})**
-
-_Reviewer intent: {cls.short_reason}_
-
-Here is a suggested implementation for the requested change:
-
-{suggestion}
-
----
-_(Generated by Gemini)_
-"""
+            suggestion_block = await anyio.to_thread.run_sync(generate_code_suggestion, payload, cls, None)
+            return BackendResponse(comment=suggestion_block)
         except Exception as e:
-<<<<<<< Updated upstream
-            # Fallback if code generation fails
-            final_comment_body = format_debug_comment(
-                payload, 
-                Classification(
-                    category="UNKNOWN",
-                    needs_reply=True,
-                    needs_clarification=False,
-                    confidence=0.0,
-                    short_reason=f"Suggestion generation failed: {type(e).__name__}: {str(e)[:160]}",
-                )
-            )
-    else:
-        # For full reviews, or other categories/low confidence inline comments, return the classification debug comment
-        final_comment_body = format_debug_comment(payload, cls)
-
-
-    return BackendResponse(comment=final_comment_body.strip())
-=======
             fallback = Classification(
                 category="UNKNOWN",
                 needs_reply=True,
@@ -965,4 +823,3 @@ _(Generated by Gemini)_
 
     # 5) Default: classification debug comment
     return BackendResponse(comment=format_debug_comment(payload, cls))
->>>>>>> Stashed changes

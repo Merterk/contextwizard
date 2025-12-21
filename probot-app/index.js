@@ -108,12 +108,9 @@ async function getPullRequest(context, owner, repo, prNumber) {
 /**
  * -----------------------------
  * Optional project context (FR2.3)
+ * Supports explicit docs[] OR scanning a directory for extensions
  * -----------------------------
  */
-// -----------------------------
-// Optional project context (FR2.3)
-// Supports explicit docs[] OR scanning a directory for extensions
-// -----------------------------
 const _ctxCache = new Map(); // `${owner}/${repo}` -> { at, docs }
 const CACHE_TTL_MS = Number(process.env.CONTEXTWIZARD_CACHE_TTL_MS || "300000"); // 5 min
 const DEFAULT_MAX_DOCS = Number(process.env.CONTEXTWIZARD_MAX_DOCS || "4");
@@ -212,7 +209,7 @@ async function listRepoFilesRecursive(context, owner, repo, branch) {
     owner,
     repo,
     tree_sha: treeSha,
-    recursive: "true"
+    recursive: "1"
   });
 
   const items = treeRes.data.tree || [];
@@ -246,7 +243,7 @@ async function getProjectContextDocs(context, owner, repo, defaultBranch) {
 
   // ---- Mode A: scan mode (your .rst folder scan)
   if (cfg.scan && cfg.scan.root && Array.isArray(cfg.scan.extensions)) {
-    const root = String(cfg.scan.root).replace(/^\/+/, "").replace(/\/+$/, ""); // trim / edges
+    const root = String(cfg.scan.root).replace(/^\/+/, "").replace(/\/+$/, "");
     const exts = cfg.scan.extensions.map(normalizeExt).filter(Boolean);
     const kind = cfg.scan.kind || null;
 
@@ -258,10 +255,8 @@ async function getProjectContextDocs(context, owner, repo, defaultBranch) {
         return exts.some((e) => p.toLowerCase().endsWith(e));
       });
 
-      // Sort for stability (so caching is consistent)
       paths.sort((a, b) => a.localeCompare(b));
 
-      // Convert to doc objects
       const docsFromScan = paths.slice(0, maxDocs).map((p) => ({ path: p, kind }));
       cfg.docs = docsFromScan; // reuse explicit loading pipeline below
     } catch (e) {
@@ -283,17 +278,14 @@ async function getProjectContextDocs(context, owner, repo, defaultBranch) {
 
   for (const d of docsList.slice(0, maxDocs)) {
     if (!d || !d.path) continue;
-
-    // stop if we hit total cap
     if (totalChars >= maxTotalChars) break;
 
     const text = await fetchRepoFileText(context, owner, repo, d.path, defaultBranch);
     if (!text) continue;
 
-    // enforce per-doc cap, then enforce total cap
-    let excerpt = text.length > maxCharsPerDoc ? text.slice(0, maxCharsPerDoc) + "\n…(truncated)…" : text;
+    let excerpt =
+      text.length > maxCharsPerDoc ? text.slice(0, maxCharsPerDoc) + "\n…(truncated)…" : text;
 
-    // trim to fit total cap
     const remaining = maxTotalChars - totalChars;
     if (excerpt.length > remaining) {
       excerpt = excerpt.slice(0, remaining) + "\n…(truncated to total cap)…";
@@ -313,7 +305,6 @@ async function getProjectContextDocs(context, owner, repo, defaultBranch) {
   _ctxCache.set(key, { at: now, docs: out });
   return out;
 }
-
 
 /**
  * Build backend payload for a single inline review comment event
@@ -342,18 +333,15 @@ async function buildReviewCommentPayload(context) {
   return {
     kind: "review_comment",
 
-    // review-level fields (unused for this kind)
     review_body: null,
     review_state: null,
 
-    // inline comment fields
     comment_body: commentBodyOriginal,
     comment_path: comment.path,
     comment_diff_hunk: comment.diff_hunk,
     comment_position: comment.position,
     comment_id: comment.id,
 
-    // shared metadata
     reviewer_login: comment.user && comment.user.login,
     pr_number: prNumber,
     pr_title: pr.title,
@@ -364,13 +352,8 @@ async function buildReviewCommentPayload(context) {
     repo_name: repoName,
     repo_default_branch: defaultBranch,
 
-    // diff context
     files,
-
-    // optional project context docs (FR2.3)
     project_context_docs,
-
-    // not included for single inline comment
     review_comments: null
   };
 }
@@ -384,11 +367,6 @@ async function buildReviewPayload(context) {
   const repo = context.payload.repository;
 
   const reviewBodyOriginal = (review.body || "").trim();
-<<<<<<< Updated upstream
-  
-  // A review with no body is usually just an APPROVED status, which we can ignore
-=======
->>>>>>> Stashed changes
   if (!reviewBodyOriginal) return null;
 
   const owner = repo.owner.login;
@@ -407,18 +385,15 @@ async function buildReviewPayload(context) {
   return {
     kind: "review",
 
-    // review-level fields
     review_body: reviewBodyOriginal,
     review_state: review.state,
 
-    // inline comment fields (unused for this kind)
     comment_body: null,
     comment_path: null,
     comment_diff_hunk: null,
     comment_position: null,
     comment_id: null,
 
-    // shared metadata
     reviewer_login: review.user && review.user.login,
     pr_number: prNumber,
     pr_title: pr.title,
@@ -429,12 +404,8 @@ async function buildReviewPayload(context) {
     repo_name: repoName,
     repo_default_branch: defaultBranch,
 
-    // diff context
     files,
-
-    // optional project context docs (FR2.3)
     project_context_docs,
-
     review_comments: null
   };
 }
@@ -455,7 +426,6 @@ async function buildIssueCommentPayload(context) {
   const commentBody = (comment.body || "").trim();
   if (!commentBody) return null;
 
-  // pull PR fields (title/body/author)
   const pr = await getPullRequest(context, owner, repoName, prNumber);
   const files = await getPrFiles(context, owner, repoName, prNumber);
   const project_context_docs = await getProjectContextDocs(
@@ -527,17 +497,6 @@ module.exports = (app) => {
   // ----------------------------------------------
   app.on("pull_request_review_comment.created", async (context) => {
     try {
-<<<<<<< Updated upstream
-      if (isFromBot(context)) {
-        context.log.info("Skipping event from bot sender.");
-        return;
-      }
-
-      const payloadForBackend = await buildReviewCommentPayload(context);
-      if (!payloadForBackend) {
-        context.log.info("Inline comment body empty, skipping.");
-        return;
-=======
       if (isFromBot(context)) return;
 
       const commentBody = (context.payload.comment.body || "").trim();
@@ -548,30 +507,15 @@ module.exports = (app) => {
 
       if (isWizardCmd) {
         payloadForBackend.kind = "wizard_review_command";
->>>>>>> Stashed changes
       }
 
       const replyBody = await callBackend(context, payloadForBackend);
       if (!replyBody) return;
 
-      const repo = context.payload.repository;
-      const pr = context.payload.pull_request;
-      const comment = context.payload.comment;
+      const owner = payloadForBackend.repo_owner;
+      const repoName = payloadForBackend.repo_name;
+      const prNumber = payloadForBackend.pr_number;
 
-<<<<<<< Updated upstream
-      const owner = repo.owner.login;
-      const repoName = repo.name;
-      const prNumber = pr.number;
-
-      await replyToInlineComment(context, owner, repoName, prNumber, comment.id, replyBody);
-
-      context.log.info(
-        { pr: prNumber, comment_id: comment.id },
-        "Replied to inline review comment."
-      );
-    } catch (err) {
-      context.log.error({ err }, "Error while handling pull_request_review_comment.created");
-=======
       await replyToInlineComment(
         context,
         owner,
@@ -582,10 +526,8 @@ module.exports = (app) => {
       );
     } catch (err) {
       context.log.error({ err }, "Error in pull_request_review_comment.created handler");
->>>>>>> Stashed changes
     }
   });
-
 
   // ----------------------------------------------
   // 2) Handle submitted Pull Request Review (top-level comment)
@@ -605,7 +547,7 @@ module.exports = (app) => {
 
       const repo = context.payload.repository;
       const pr = context.payload.pull_request;
-      
+
       const owner = repo.owner.login;
       const repoName = repo.name;
       const prNumber = pr.number;
@@ -623,7 +565,6 @@ module.exports = (app) => {
     try {
       if (isFromBot(context)) return;
 
-      // only react to issue comments that are on PRs
       const issue = context.payload.issue;
       if (!issue || !issue.pull_request) return;
 
@@ -645,7 +586,6 @@ module.exports = (app) => {
       const repoName = repo.name;
       const prNumber = issue.number;
 
-      // Optional: mention commenter for normal chat replies
       const commenter = context.payload.comment.user && context.payload.comment.user.login;
       const finalBody =
         !isWizardCmd && commenter ? `@${commenter} ${replyBody}` : replyBody;
